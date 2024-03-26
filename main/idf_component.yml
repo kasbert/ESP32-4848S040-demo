@@ -1,12 +1,12 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/esp_lcd_touch_gt911: "^1"
-  espressif/esp_lvgl_port: "^1"
-  espressif/esp_lcd_panel_io_additions: "^1.0.1"
-  espressif/esp_lcd_st7701: "*"
+  espressif/esp_lvgl_port: "^2"
+  espressif/esp_lcd_panel_io_additions: "^1.0"
+  espressif/esp_lcd_st7701: "^1.0"
   ## Required IDF version
   idf:
-    version: ">=4.1.0"
+    version: ">=5.2.0"
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"

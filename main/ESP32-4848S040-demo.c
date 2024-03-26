@@ -12,6 +12,7 @@ https://github.com/arendst/Tasmota/discussions/20527
 #include <esp_log.h>
 #include <esp_check.h>
 
+// lcd
 #include "driver/gpio.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
@@ -27,13 +28,20 @@ https://github.com/arendst/Tasmota/discussions/20527
 #include "esp_lcd_touch_gt911.h"
 #endif
 
+// sd card
+#include <sys/unistd.h>
+#include <sys/stat.h>
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include <driver/sdmmc_defs.h>
+#include <sys/types.h>
+#include <dirent.h>
+
 static const char *TAG = "demo";
 
 #define LVGL_TICK_PERIOD_MS 2
 #include "esp_attr.h"
 #include "esp_timer.h"
-
-static void lcd_panel_test(esp_lcd_panel_handle_t panel_handle);
 
 #include <esp_random.h>
 #include "demos/widgets/lv_demo_widgets.h"
@@ -43,7 +51,22 @@ typedef struct {
     esp_lcd_panel_handle_t      panel_handle;
     esp_lcd_panel_io_handle_t   touch_io_handle;
     esp_lcd_touch_handle_t      touch_handle;
+    char *mount_point;
+    sdmmc_card_t *card; // = &sdmmc_card;
+    int host_slot;
+    lv_obj_t *file_table;
+    lv_obj_t *fsinfo_label;
+    lv_obj_t *mount_label;
+    lv_obj_t * mbox1;
 } example_display_ctx_t;
+
+static void lcd_panel_test(esp_lcd_panel_handle_t panel_handle);
+static void sd_widget(example_display_ctx_t *disp_ctx);
+static void sd_filetest(sdmmc_card_t *card);
+static bool sd_mount(example_display_ctx_t *ctx);
+static void sd_unmount(example_display_ctx_t *ctx);
+static void sd_list_files(char *path);
+#define MOUNT_POINT "/sdcard"
 
 const st7701_lcd_init_cmd_t lcd_init_cmds1[] = {
     //BEGIN_WRITE,
@@ -118,10 +141,8 @@ static void backlight_del() {
 }
 
 
-static example_display_ctx_t *example_panel_init() {
+static bool example_panel_init(example_display_ctx_t *disp_ctx) {
     esp_err_t ret = ESP_OK;
-    example_display_ctx_t *disp_ctx = malloc(sizeof(example_display_ctx_t));
-    ESP_GOTO_ON_FALSE(disp_ctx, ESP_ERR_NO_MEM, err, TAG, "Not enough memory for display context allocation!");
 
     backlight_init();
     // Turn off backlight to avoid unpredictable display on the LCD screen while initializing
@@ -316,10 +337,7 @@ static example_display_ctx_t *example_panel_init() {
     disp_ctx->panel_handle = panel_handle;
 
     backlight_on();
-    return disp_ctx;
-
-    err:
-    return NULL;
+    return true;
 }
 
 static void example_panel_del(example_display_ctx_t *disp_ctx, lv_disp_t *disp) {
@@ -338,9 +356,9 @@ static void example_panel_del(example_display_ctx_t *disp_ctx, lv_disp_t *disp) 
 IRAM_ATTR
 static bool lvgl_flush_ready_callback(struct esp_lcd_panel_t *panel_io, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx)
 {
-    lv_disp_drv_t *disp_drv = (lv_disp_drv_t *)user_ctx;
+    lv_display_t *disp_drv = (lv_display_t *)user_ctx;
     assert(disp_drv != NULL);
-    lv_disp_flush_ready(disp_drv);
+    lv_display_flush_ready(disp_drv);
     return false;
 }
 
@@ -378,9 +396,9 @@ static lv_disp_t * example_lvgl_init(example_display_ctx_t *disp_ctx) {
         .on_vsync = lvgl_flush_ready_callback,
     };
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(disp_ctx->panel_handle, &cbs,
-                                                             disp->driver));
+                                                             disp));
     /* Rotation of the screen */
-    lv_disp_set_rotation(disp, LV_DISP_ROT_NONE);
+    lv_disp_set_rotation(disp, LV_DISPLAY_ROTATION_0);
 
 #if CONFIG_EXAMPLE_TOUCH_I2C_NUM > -1
     /* Add touch input (for selected screen) */
@@ -398,21 +416,34 @@ static lv_disp_t * example_lvgl_init(example_display_ctx_t *disp_ctx) {
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "PSRAM free size: %d", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    esp_err_t ret = ESP_OK;
+    lv_disp_t *disp =  0;
 
-    example_display_ctx_t *ctx = example_panel_init();
+    ESP_LOGI(TAG, "PSRAM free size: %d", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    example_display_ctx_t *ctx = malloc(sizeof(example_display_ctx_t));
+    ESP_GOTO_ON_FALSE(ctx, ESP_ERR_NO_MEM, err, TAG, "Not enough memory for display context allocation!");
+    memset(ctx, 0, sizeof(example_display_ctx_t));
+    ctx->host_slot = SPI2_HOST;
+    ctx->mount_point = MOUNT_POINT;
+    ctx->card = 0;
+    example_panel_init(ctx);
 
     lcd_panel_test(ctx->panel_handle);
 
-    lv_disp_t *disp = example_lvgl_init(ctx);
+    disp = example_lvgl_init(ctx);
 
-    lv_demo_widgets();
+    //lv_demo_widgets();
+#if 1
+    sd_widget(ctx);
+#endif
 
     while (1) {
         /* Delay 1 tick (assumes FreeRTOS tick is 10ms */
         vTaskDelay(pdMS_TO_TICKS(LVGL_TICK_PERIOD_MS));
         lv_task_handler();
     }
+    err:
+    sd_unmount(ctx);
     example_panel_del(ctx, disp);
 }
 
@@ -496,4 +527,598 @@ static void lcd_panel_test(esp_lcd_panel_handle_t panel_handle)
 #define CONFIG_EXAMPLE_TOUCH_I2C_SCL           (GPIO_NUM_45)
 #define CONFIG_EXAMPLE_TOUCH_GPIO_INT          (GPIO_NUM_NC)
 #define CONFIG_EXAMPLE_TOUCH_GPIO_RST          (GPIO_NUM_NC)
+
+/* SD card */
+#define CONFIG_EXAMPLE_PIN_MOSI 47
+#define CONFIG_EXAMPLE_PIN_MISO 41
+#define CONFIG_EXAMPLE_PIN_CLK 48
+#define CONFIG_EXAMPLE_PIN_CS 42
+
 #endif
+
+static void show_dir(lv_obj_t * file_table, const char * path);
+
+
+// Initialize sdcard without mounting
+static void sdcard_init(example_display_ctx_t *ctx) {
+    esp_err_t ret = ESP_OK;
+
+    ESP_LOGI(TAG, "Initializing SD card");
+
+    ESP_LOGI(TAG, "Using SPI peripheral");
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = CONFIG_EXAMPLE_PIN_MOSI,
+        .miso_io_num = CONFIG_EXAMPLE_PIN_MISO,
+        .sclk_io_num = CONFIG_EXAMPLE_PIN_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    ret = spi_bus_initialize(ctx->host_slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to initialize bus.");
+
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = CONFIG_EXAMPLE_PIN_CS;
+    slot_config.host_id = ctx->host_slot;
+
+    int card_handle = -1;   //uninitialized
+    static sdmmc_card_t sdmmc_card;
+    sdmmc_card_t *card = &sdmmc_card;
+
+    ESP_LOGI(TAG, "init");
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = ctx->host_slot;
+    ret = host.init();
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Host init failed");
+
+    ESP_LOGI(TAG, "init_sdspi_host");
+
+    ret = sdspi_host_init_device(&slot_config, &card_handle);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "sdspi_host_init_device failed.");
+
+    // probe and initialize card
+    ESP_LOGI(TAG, "sdmmc_card_init");
+    ret = sdmmc_card_init(&host, card);
+    ESP_GOTO_ON_ERROR(ret, cleanup_host, TAG, "sdmmc_card_init failed");
+
+    ctx->card = card;
+    return;
+
+cleanup_host:
+    //call_host_deinit(host_config);
+    if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
+        host.deinit_p(host.slot);
+    } else {
+        host.deinit();
+    }
+cleanup:
+  return ;
+}
+
+static void sdcard_deinit(example_display_ctx_t *ctx) {
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = ctx->host_slot;
+    if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
+        host.deinit_p(host.slot);
+    } else {
+        host.deinit();
+    }
+    spi_bus_free(ctx->host_slot);
+    ctx->card = 0;
+}
+
+static bool sd_mount(example_display_ctx_t *ctx) {
+    esp_err_t ret;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = CONFIG_EXAMPLE_PIN_MOSI,
+        .miso_io_num = CONFIG_EXAMPLE_PIN_MISO,
+        .sclk_io_num = CONFIG_EXAMPLE_PIN_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    ret = spi_bus_initialize(ctx->host_slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return false;
+    }
+
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = CONFIG_EXAMPLE_PIN_CS;
+    //slot_config.gpio_cd = PIN_NUM_CD;
+    slot_config.host_id = ctx->host_slot;
+
+    ESP_LOGI(TAG, "Mounting filesystem");
+    // Options for mounting the filesystem.
+    // If format_if_mount_failed is set to true, SD card will be partitioned and
+    // formatted in case when mounting fails.
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+#ifdef CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
+        .format_if_mount_failed = true,
+#else
+        .format_if_mount_failed = false,
+#endif // EXAMPLE_FORMAT_IF_MOUNT_FAILED
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    // By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
+    // For setting a specific frequency, use host.max_freq_khz (range 400kHz - 20MHz for SDSPI)
+    // Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = ctx->host_slot;
+    ret = esp_vfs_fat_sdspi_mount(ctx->mount_point, &host, &slot_config, &mount_config, &ctx->card);
+
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount filesystem. "
+                     "If you want the card to be formatted, set the CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
+                     "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+        }
+        return false;
+    }
+    ESP_LOGI(TAG, "Filesystem mounted");
+    return true;
+}
+
+static void sd_unmount(example_display_ctx_t *ctx) {
+  if (ctx->card) {
+    esp_vfs_fat_sdcard_unmount(ctx->mount_point, ctx->card);
+    ESP_LOGI(TAG, "Card unmounted");
+
+    // deinitialize the bus after all devices are removed
+    spi_bus_free(ctx->host_slot);
+    ctx->card = 0;
+  }
+}
+
+bool sd_format(example_display_ctx_t *ctx) {
+    esp_err_t ret;
+    if (!ctx->card) {
+        return false;
+    }
+    // Format FATFS
+    ret = esp_vfs_fat_sdcard_format(ctx->mount_point, ctx->card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to format FATFS (%s)", esp_err_to_name(ret));
+        return false;
+    }
+    ESP_LOGI(TAG, "Filesystem formatted");
+    return true;
+}
+
+// UI functions
+
+static void sdmmc_card_info(lv_obj_t *label, const sdmmc_card_t *card) {
+  const char *type;
+
+  if (!card) {
+    lv_label_set_text(label, "No card mounted\n");
+    return;
+  }
+
+  if (card->is_sdio) {
+    type = "SDIO";
+  } else if (card->is_mmc) {
+    type = "MMC";
+  } else {
+    type = (card->ocr & SD_OCR_SDHC_CAP) ? "SDHC/SDXC" : "SDSC";
+  }
+
+  lv_label_set_text_fmt(
+      label, "Name: %s\nType: %s\nSize: %lluMB\n", card->cid.name, type,
+      ((uint64_t)card->csd.capacity) * card->csd.sector_size / (1024 * 1024));
+}
+
+static void show_disk_free(lv_obj_t *fsinfo_label, const char *mount_point) {
+    uint64_t out_total_bytes;
+    uint64_t out_free_bytes;
+    int ret = esp_vfs_fat_info(mount_point, &out_total_bytes, &out_free_bytes);
+    if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to esp_vfs_fat_info.");
+    return;
+    }
+    ESP_LOGI(TAG, "Total bytes: %lld, free bytes: %lld", out_total_bytes,
+            out_free_bytes);
+
+    lv_label_set_text_fmt(fsinfo_label, "Total bytes: %lld\nFree bytes: %lld",
+        out_total_bytes, out_free_bytes);
+}
+
+static void mount_event_handler(lv_event_t *e) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)e->user_data;
+
+    if (!ctx->card) {
+        ESP_LOGI(TAG, "Mounting SD card");
+        sd_mount(ctx);
+        sdmmc_card_print_info(stdout, ctx->card);
+        show_disk_free(ctx->fsinfo_label, ctx->mount_point);
+        lv_label_set_text(ctx->mount_label, "Unmount");
+        sd_list_files(ctx->mount_point);
+        show_dir(ctx->file_table, ctx->mount_point);
+    } else {
+        ESP_LOGI(TAG, "Unmounting SD card");
+        sd_unmount(ctx);
+        lv_label_set_text_fmt(ctx->fsinfo_label, "Not mounted");
+        lv_label_set_text(ctx->mount_label, "Mount");
+        lv_table_set_row_count(ctx->file_table, 0);
+    }
+}
+
+
+static void event_cb(lv_event_t * e)
+{
+    lv_obj_t * btn = lv_event_get_target(e);
+    lv_obj_t * label = lv_obj_get_child(btn, 0);
+    LV_UNUSED(label);
+    LV_LOG_USER("Button %s clicked", lv_label_get_text(label));
+}
+
+static void dialog_yes_event_handler(lv_event_t *e) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)e->user_data;
+    lv_msgbox_close(ctx->mbox1);
+    if (!ctx->card) {
+        ESP_LOGI(TAG, "Mounting SD card");
+        sd_mount(ctx);
+    }
+    ESP_LOGI(TAG, "Formatting SD card");
+    sd_format(ctx);
+    show_dir(ctx->file_table, ctx->mount_point);
+    show_disk_free(ctx->fsinfo_label, ctx->mount_point);
+    lv_label_set_text(ctx->mount_label, "Unmount");
+}
+
+static void dialog_no_event_handler(lv_event_t *e) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)e->user_data;
+    lv_msgbox_close(ctx->mbox1);
+}
+
+static void format_event_handler(lv_event_t *e) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)e->user_data;
+
+    ctx->mbox1 = lv_msgbox_create(NULL);
+
+    lv_msgbox_add_title(ctx->mbox1, "Are you sure?");
+
+    lv_msgbox_add_text(ctx->mbox1, "Formatting will wipe out all files");
+    lv_msgbox_add_close_button(ctx->mbox1);
+
+    lv_obj_t * btn;
+    //btn = lv_msgbox_add_footer_button(ctx->mbox1, "Yes");
+    //lv_obj_add_event_cb(btn, dialog_yes_event_handler, LV_EVENT_CLICKED, ctx);
+    btn = lv_msgbox_add_footer_button(ctx->mbox1, "No");
+    lv_obj_add_event_cb(btn, dialog_no_event_handler, LV_EVENT_CLICKED, ctx);
+}
+
+static void test_event_handler(lv_event_t *e) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)e->user_data;
+    ESP_LOGI(TAG, "Testing SD card file operations");
+    if (ctx->card) {
+        sd_filetest(ctx->card);
+        sd_list_files(ctx->mount_point);
+        show_dir(ctx->file_table, ctx->mount_point);
+    }
+}
+
+static bool is_end_with(const char * str1, const char * str2)
+{
+    if(str1 == NULL || str2 == NULL)
+        return false;
+    uint16_t len1 = lv_strlen(str1);
+    uint16_t len2 = lv_strlen(str2);
+    if((len1 < len2) || (len1 == 0 || len2 == 0))
+        return false;
+    while(len2 >= 1) {
+        if(str2[len2 - 1] != str1[len1 - 1])
+            return false;
+        len2--;
+        len1--;
+    }
+    return true;
+}
+
+#define LV_FILE_EXPLORER_PATH_MAX_LEN 64
+
+static void show_dir(lv_obj_t * file_table, const char * path)
+{
+    uint16_t index = 0;
+#if CONFIG_LV_USE_FS_POSIX
+    DIR* dir = opendir(path);
+    if (dir == NULL) {
+        LV_LOG_USER("Open dir error!");
+        return;
+    }
+#else
+    char fn[LV_FILE_EXPLORER_PATH_MAX_LEN];
+    lv_fs_dir_t dir;
+    lv_fs_res_t res;
+
+    res = lv_fs_dir_open(&dir, path);
+    if(res != LV_FS_RES_OK) {
+        LV_LOG_USER("Open dir error %d!", res);
+        return;
+    }
+#endif
+
+    /*
+    lv_table_set_cell_value_fmt(file_table, index++, 0, LV_SYMBOL_DIRECTORY "  %s", ".");
+    lv_table_set_cell_value_fmt(file_table, index++, 0, LV_SYMBOL_DIRECTORY "  %s", "..");
+    lv_table_set_cell_value(file_table, 0, 1, "0");
+    lv_table_set_cell_value(file_table, 1, 1, "0");
+    */
+
+    while(1) {
+#if CONFIG_LV_USE_FS_POSIX
+        struct dirent* de = readdir(dir);
+        if (!de) {
+            break;
+        }
+        char *fn = de->d_name;
+#else
+        res = lv_fs_dir_read(&dir, fn, sizeof(fn));
+        if(res != LV_FS_RES_OK) {
+            LV_LOG_USER("Driver, file or directory is not exists %d!", res);
+            break;
+        }
+
+        /*fn is empty, if not more files to read*/
+        if(lv_strlen(fn) == 0) {
+            LV_LOG_USER("Not more files to read!");
+            break;
+        }
+#endif
+
+        if((is_end_with(fn, ".png") == true)  || (is_end_with(fn, ".PNG") == true)  || \
+           (is_end_with(fn, ".jpg") == true) || (is_end_with(fn, ".JPG") == true) || \
+           (is_end_with(fn, ".bmp") == true) || (is_end_with(fn, ".BMP") == true) || \
+           (is_end_with(fn, ".gif") == true) || (is_end_with(fn, ".GIF") == true)) {
+            lv_table_set_cell_value_fmt(file_table, index, 0, LV_SYMBOL_IMAGE "  %s", fn);
+            lv_table_set_cell_value(file_table, index, 1, "1");
+        }
+        else if((is_end_with(fn, ".mp3") == true) || (is_end_with(fn, ".MP3") == true) || \
+                (is_end_with(fn, ".wav") == true) || (is_end_with(fn, ".WAV") == true)) {
+            lv_table_set_cell_value_fmt(file_table, index, 0, LV_SYMBOL_AUDIO "  %s", fn);
+            lv_table_set_cell_value(file_table, index, 1, "2");
+        }
+        else if((is_end_with(fn, ".mp4") == true) || (is_end_with(fn, ".MP4") == true)) {
+            lv_table_set_cell_value_fmt(file_table, index, 0, LV_SYMBOL_VIDEO "  %s", fn);
+            lv_table_set_cell_value(file_table, index, 1, "3");
+        }
+        else if((is_end_with(fn, ".") == true) || (is_end_with(fn, "..") == true)) {
+            /*is dir*/
+            continue;
+        }
+#if CONFIG_LV_USE_FS_POSIX
+        else if(de->d_type == DT_DIR) {/*is dir*/
+#else
+        else if(fn[0] == '/') {/*is dir*/
+#endif
+
+            lv_table_set_cell_value_fmt(file_table, index, 0, LV_SYMBOL_DIRECTORY "  %s", fn + 1);
+            lv_table_set_cell_value(file_table, index, 1, "0");
+        }
+        else {
+            lv_table_set_cell_value_fmt(file_table, index, 0, LV_SYMBOL_FILE "  %s", fn);
+            lv_table_set_cell_value(file_table, index, 1, "4");
+        }
+
+        index++;
+    }
+
+#if CONFIG_LV_USE_FS_POSIX
+    closedir(dir);
+#else
+    lv_fs_dir_close(&dir);
+#endif
+
+    lv_table_set_row_count(file_table, index);
+    lv_obj_scroll_to_y(file_table, 0, LV_ANIM_OFF);
+}
+
+static void sd_widget(example_display_ctx_t *ctx) {
+
+    lv_disp_t *dispp = lv_disp_get_default();
+    lv_theme_t *theme = lv_theme_default_init(dispp, lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_RED), true, LV_FONT_DEFAULT);
+    lv_disp_set_theme(dispp, theme);
+
+    lv_obj_t *container = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(container, LV_PCT(100), LV_PCT(100));
+    lv_obj_clear_flag( container, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+    lv_obj_set_style_bg_color(container, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT );
+    lv_obj_set_style_bg_opa(container, 255, LV_PART_MAIN| LV_STATE_DEFAULT);
+
+    lv_obj_set_style_text_font(lv_scr_act(), LV_FONT_DEFAULT, 0);
+
+
+    lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(container, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                            LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *cont1 = lv_obj_create(container);
+    // lv_obj_set_size(cont, 300, 220);
+    lv_obj_set_width(cont1, lv_pct(100));
+    lv_obj_set_height(cont1, LV_SIZE_CONTENT);
+    lv_obj_center(cont1);
+    lv_obj_set_flex_flow(cont1, LV_FLEX_FLOW_ROW);
+
+    lv_obj_t *card_label = lv_label_create(cont1);
+    lv_obj_set_width(card_label, lv_pct(50));
+    if (ctx->card) {
+        sdmmc_card_print_info(stdout, ctx->card);
+        sdmmc_card_info(card_label, ctx->card);
+    } else {
+        // Temporary init to get info
+        sdcard_init(ctx);
+        ESP_LOGI(TAG, "sdmmc_card_print_info");
+        // Card has been initialized, print its properties
+        sdmmc_card_print_info(stdout, ctx->card);
+        sdmmc_card_info(card_label, ctx->card);
+        sdcard_deinit(ctx);
+    }
+    ctx->fsinfo_label = lv_label_create(cont1);
+    lv_obj_set_width(ctx->fsinfo_label, lv_pct(50));
+    lv_label_set_text_fmt(ctx->fsinfo_label, "Not mounted");
+
+    lv_obj_t *cont2 = lv_obj_create(container);
+    // lv_obj_set_size(cont, 300, 220);
+    lv_obj_set_width(cont2, lv_pct(100));
+    lv_obj_set_height(cont2, LV_SIZE_CONTENT);
+    lv_obj_center(cont2);
+    lv_obj_set_flex_flow(cont2, LV_FLEX_FLOW_ROW);
+
+    //lv_example_spinbox_1(cont2);
+
+    lv_obj_t *mount_btn = lv_btn_create(cont2);
+    lv_obj_set_height(mount_btn, LV_SIZE_CONTENT);
+    lv_obj_set_width(mount_btn, LV_PCT(33));
+    ctx->mount_label = lv_label_create(mount_btn);
+    lv_label_set_text(ctx->mount_label, "Mount"); // or Unmount
+    //lv_obj_set_width(ctx->mount_label, 100);
+    lv_obj_center(ctx->mount_label);
+    lv_obj_add_event_cb(mount_btn, mount_event_handler, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *format_btn = lv_btn_create(cont2);
+    lv_obj_set_height(format_btn, LV_SIZE_CONTENT);
+    lv_obj_set_width(format_btn, LV_PCT(33));
+    lv_obj_t *format_label = lv_label_create(format_btn);
+    lv_label_set_text(format_label, "Format");
+    lv_obj_center(format_label);
+    lv_obj_add_event_cb(format_btn, format_event_handler, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *test_btn = lv_btn_create(cont2);
+    lv_obj_set_height(test_btn, LV_SIZE_CONTENT);
+    lv_obj_set_width(test_btn, LV_PCT(33));
+    lv_obj_t *test_label = lv_label_create(test_btn);
+    lv_label_set_text(test_label, "Test");
+    lv_obj_center(test_label);
+    lv_obj_add_event_cb(test_btn, test_event_handler, LV_EVENT_CLICKED, ctx);
+
+    /*Table showing the contents of the table of contents*/
+    lv_obj_t *file_table = lv_table_create(container);
+    lv_obj_set_size(file_table, LV_PCT(100), LV_PCT(86));
+    lv_table_set_column_width(file_table, 0, LV_PCT(100));
+    lv_table_set_column_count(file_table, 1);
+
+    lv_obj_set_scroll_dir(file_table, LV_DIR_TOP | LV_DIR_BOTTOM);
+    ctx->file_table = file_table;
+}
+
+// test utility
+
+static void sd_list_files(char *path) {
+  DIR *dir;
+  struct dirent *ent;
+  ESP_LOGI(TAG, "DIR------------ %s ", path);
+  if ((dir = opendir(path)) != NULL) {
+    /* print all the files and directories within directory */
+    while ((ent = readdir(dir)) != NULL) {
+      ESP_LOGI(TAG, " %s", ent->d_name);
+    }
+    closedir(dir);
+  } else {
+    ESP_LOGE(TAG, "Cannot open %s", path);
+  }
+  ESP_LOGI(TAG, "------------");
+}
+
+#define EXAMPLE_MAX_CHAR_SIZE    64
+
+static esp_err_t s_example_write_file(const char *path, char *data)
+{
+    ESP_LOGI(TAG, "Opening file %s", path);
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        return ESP_FAIL;
+    }
+    fprintf(f, data);
+    fclose(f);
+    ESP_LOGI(TAG, "File written");
+
+    return ESP_OK;
+}
+
+static esp_err_t s_example_read_file(const char *path)
+{
+    ESP_LOGI(TAG, "Reading file %s", path);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+        return ESP_FAIL;
+    }
+    char line[EXAMPLE_MAX_CHAR_SIZE];
+    fgets(line, sizeof(line), f);
+    fclose(f);
+
+    // strip newline
+    char *pos = strchr(line, '\n');
+    if (pos) {
+        *pos = '\0';
+    }
+    ESP_LOGI(TAG, "Read from file: '%s'", line);
+
+    return ESP_OK;
+}
+
+static void sd_filetest(sdmmc_card_t *card)
+{
+    // Use POSIX and C standard library functions to work with files.
+    // First create a file.
+    const char *file_hello = MOUNT_POINT"/hello.txt";
+    char data[EXAMPLE_MAX_CHAR_SIZE];
+    snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "%s %s!\n", "Hello", card->cid.name);
+    esp_err_t ret = s_example_write_file(file_hello, data);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    const char *file_foo = MOUNT_POINT"/foo.txt";
+
+    // Check if destination file exists before renaming
+    struct stat st;
+    if (stat(file_foo, &st) == 0) {
+        // Delete it if it exists
+        unlink(file_foo);
+    }
+
+    // Rename original file
+    ESP_LOGI(TAG, "Renaming file %s to %s", file_hello, file_foo);
+    if (rename(file_hello, file_foo) != 0) {
+        ESP_LOGE(TAG, "Rename failed");
+        return;
+    }
+
+    ret = s_example_read_file(file_foo);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    if (stat(file_foo, &st) == 0) {
+        ESP_LOGI(TAG, "file still exists");
+        //return;
+    } else {
+        ESP_LOGI(TAG, "file doesnt exist, format done");
+    }
+
+    const char *file_nihao = MOUNT_POINT"/nihao.txt";
+    memset(data, 0, EXAMPLE_MAX_CHAR_SIZE);
+    snprintf(data, EXAMPLE_MAX_CHAR_SIZE, "%s %s!\n", "Nihao", card->cid.name);
+    ret = s_example_write_file(file_nihao, data);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    //Open file for reading
+    ret = s_example_read_file(file_nihao);
+    if (ret != ESP_OK) {
+        return;
+    }
+
+    sd_list_files(MOUNT_POINT);
+}
