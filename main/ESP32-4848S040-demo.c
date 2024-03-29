@@ -18,6 +18,7 @@ https://github.com/arendst/Tasmota/discussions/20527
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_io_additions.h"
 #include "esp_lcd_st7701.h"
+#include "driver/ledc.h"
 
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
@@ -58,6 +59,7 @@ typedef struct {
     lv_obj_t *fsinfo_label;
     lv_obj_t *mount_label;
     lv_obj_t * mbox1;
+    lv_timer_t * backlight_timer;
 } example_display_ctx_t;
 
 static void lcd_panel_test(esp_lcd_panel_handle_t panel_handle);
@@ -118,6 +120,51 @@ const st7701_lcd_init_cmd_t lcd_init_cmds1[] = {
     //END_WRITE
 };
 
+#define USE_BACKLIGHT_PWM 1
+#if USE_BACKLIGHT_PWM
+#define EXAMPLE_LEDC_CHANNEL LEDC_CHANNEL_3
+#define EXAMPLE_LEDC_TIMER LEDC_TIMER_3
+
+void backlight_level(int level) { // 0 - 1023
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, EXAMPLE_LEDC_CHANNEL, level);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, EXAMPLE_LEDC_CHANNEL);
+}
+
+void backlight_on() {
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, EXAMPLE_LEDC_CHANNEL, 1023);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, EXAMPLE_LEDC_CHANNEL);
+}
+
+void backlight_off() {
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, EXAMPLE_LEDC_CHANNEL, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, EXAMPLE_LEDC_CHANNEL);
+}
+
+static void backlight_del() {
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_reset_pin(CONFIG_EXAMPLE_LCD_BK_LIGHT_PIN));
+}
+
+static void backlight_init() {
+    ledc_timer_config_t ledc_timer = {
+        .duty_resolution = LEDC_TIMER_10_BIT, // resolution of PWM duty
+        .freq_hz = 5000,                      // frequency of PWM signal
+        .speed_mode = LEDC_LOW_SPEED_MODE,           // timer mode
+        .timer_num = EXAMPLE_LEDC_TIMER,            // timer index
+        .clk_cfg = LEDC_AUTO_CLK,              // Auto select the source clock
+    };
+    ledc_timer_config(&ledc_timer);
+    ledc_channel_config_t led_cfg = {
+        .channel    = EXAMPLE_LEDC_CHANNEL,
+        .duty       = 0,
+        .gpio_num   = CONFIG_EXAMPLE_LCD_BK_LIGHT_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .hpoint     = 0,
+        .timer_sel  = EXAMPLE_LEDC_TIMER
+    };
+    ledc_channel_config(&led_cfg);
+}
+
+#else
 void backlight_on() {
     // Turn on backlight (Different LCD screens may need different levels)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_set_level(CONFIG_EXAMPLE_LCD_BK_LIGHT_PIN, CONFIG_EXAMPLE_LCD_BK_LIGHT_ON_LEVEL));
@@ -139,7 +186,7 @@ static void backlight_init() {
 static void backlight_del() {
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_reset_pin(CONFIG_EXAMPLE_LCD_BK_LIGHT_PIN));
 }
-
+#endif
 
 static bool example_panel_init(example_display_ctx_t *disp_ctx) {
     esp_err_t ret = ESP_OK;
@@ -751,13 +798,19 @@ static void mount_event_handler(lv_event_t *e) {
     }
 }
 
+void backlight_timer_cb(lv_timer_t * t) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)t->user_data;
+    backlight_level(80);
+    lv_timer_pause(t);
+}
 
-static void event_cb(lv_event_t * e)
-{
-    lv_obj_t * btn = lv_event_get_target(e);
-    lv_obj_t * label = lv_obj_get_child(btn, 0);
-    LV_UNUSED(label);
-    LV_LOG_USER("Button %s clicked", lv_label_get_text(label));
+static void backlight_event_cb(lv_event_t * e) {
+    example_display_ctx_t *ctx = (example_display_ctx_t *)e->user_data;
+    if (lv_timer_get_paused(ctx->backlight_timer)) {
+        backlight_level(1023);
+        lv_timer_reset(ctx->backlight_timer);
+        lv_timer_resume(ctx->backlight_timer);
+    }
 }
 
 static void dialog_yes_event_handler(lv_event_t *e) {
@@ -926,6 +979,9 @@ static void sd_widget(example_display_ctx_t *ctx) {
     lv_disp_t *dispp = lv_disp_get_default();
     lv_theme_t *theme = lv_theme_default_init(dispp, lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_RED), true, LV_FONT_DEFAULT);
     lv_disp_set_theme(dispp, theme);
+
+    ctx->backlight_timer = lv_timer_create(backlight_timer_cb, 30000,  ctx);
+    lv_obj_add_event_cb(lv_scr_act(), backlight_event_cb, LV_EVENT_ALL, ctx);
 
     lv_obj_t *container = lv_obj_create(lv_scr_act());
     lv_obj_set_size(container, LV_PCT(100), LV_PCT(100));
